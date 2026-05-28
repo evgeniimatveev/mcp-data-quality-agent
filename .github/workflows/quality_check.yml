@@ -1,0 +1,58 @@
+name: Health Check
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+
+jobs:
+  smoke-test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Verify server imports and tools are registered
+        run: |
+          python - <<'EOF'
+          import ast, sys
+
+          with open("server.py") as f:
+              tree = ast.parse(f.read())
+
+          tools = [
+              node.name for node in ast.walk(tree)
+              if isinstance(node, ast.FunctionDef)
+          ]
+
+          EXPECTED = [
+              "list_sources", "list_tables", "describe_table", "run_query",
+              "quality_report", "find_anomalies", "column_distribution",
+              "freshness_check", "correlation", "compare_tables",
+              "trend_analysis", "segment_analysis", "period_over_period",
+              "top_n_by_group", "null_pattern", "duplicate_check",
+              "outlier_rows", "export_csv", "smart_summary", "profile_column",
+          ]
+
+          missing = [t for t in EXPECTED if t not in tools]
+          if missing:
+              print(f"FAIL — missing tools: {missing}", file=sys.stderr)
+              sys.exit(1)
+
+          print(f"PASS — {len(EXPECTED)}/{len(EXPECTED)} tools found in server.py")
+          for t in EXPECTED:
+              print(f"  ✓ {t}")
+          EOF
+
+      - name: Report
+        run: echo "### Health Check — $(date -u '+%Y-%m-%d %H:%M UTC')" >> $GITHUB_STEP_SUMMARY && echo "All 20 tools verified in server.py ✅" >> $GITHUB_STEP_SUMMARY

@@ -1,0 +1,5 @@
+mcp>=1.0.0
+duckdb>=0.10.0
+psycopg2-binary>=2.9.0
+pandas>=2.0.0
+python-dotenv>=1.0.0
