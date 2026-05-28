@@ -53,9 +53,23 @@ An MCP server that gives Claude direct, read-only access to four DuckDB database
 </details>
 
 <details>
+<summary>🩺 quality_report — nulls, duplicates, numeric stats</summary>
+
+![Quality Report](assets/quality_report.png)
+
+</details>
+
+<details>
 <summary>🔍 find_anomalies — IQR outlier detection</summary>
 
 ![Anomaly Detection](assets/anomaly_detection.png)
+
+</details>
+
+<details>
+<summary>⚡ run_query — freeform SQL via MCP</summary>
+
+![Run Query](assets/run_query.png)
 
 </details>
 
