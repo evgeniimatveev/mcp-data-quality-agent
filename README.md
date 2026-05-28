@@ -74,6 +74,20 @@ An MCP server that gives Claude direct, read-only access to four DuckDB database
 </details>
 
 <details>
+<summary>🔬 profile_column — full statistical portrait of one column</summary>
+
+![Profile Column](assets/profile_column.png)
+
+</details>
+
+<details>
+<summary>🚨 outlier_rows — full row context for every outlier</summary>
+
+![Outlier Rows](assets/outlier_rows.png)
+
+</details>
+
+<details>
 <summary>🏆 top_n_by_group — top 3 salaries per tech stack</summary>
 
 ![Top N by Group](assets/top_n_by_group.png)
