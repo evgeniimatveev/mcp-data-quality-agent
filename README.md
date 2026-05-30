@@ -1,14 +1,16 @@
 # Ask your data. Claude answers.
 
-### MCP Data Quality Agent — 20 tools · 5 databases · natural language
+### MCP Data Quality Agent — 19 tools · 5 databases · natural language
 
 <p align="center">
+  <a href="https://github.com/evgeniimatveev/mcp-data-quality-agent/actions/workflows/quality_check.yml">
+    <img src="https://github.com/evgeniimatveev/mcp-data-quality-agent/actions/workflows/quality_check.yml/badge.svg" alt="CI"/>
+  </a>
   <img src="https://img.shields.io/badge/Python-3.11-3776AB?style=flat-square&logo=python&logoColor=white"/>
   <img src="https://img.shields.io/badge/FastMCP-1.0-6C3483?style=flat-square&logo=anthropic&logoColor=white"/>
   <img src="https://img.shields.io/badge/DuckDB-1.5-FFF000?style=flat-square&logo=duckdb&logoColor=black"/>
   <img src="https://img.shields.io/badge/PostgreSQL-Supabase-4169E1?style=flat-square&logo=postgresql&logoColor=white"/>
-  <img src="https://img.shields.io/badge/MCP-Protocol-FF6B35?style=flat-square&logo=anthropic&logoColor=white"/>
-  <img src="https://img.shields.io/badge/tools-20-2ECC71?style=flat-square"/>
+  <img src="https://img.shields.io/badge/tools-19-2ECC71?style=flat-square"/>
 </p>
 
 An MCP server that gives Claude direct, read-only access to four DuckDB databases and a Supabase PostgreSQL instance. Claude picks the right tool, writes the SQL, runs it, and interprets the result — no copy-paste, no context-switching, no boilerplate.
@@ -81,13 +83,6 @@ An MCP server that gives Claude direct, read-only access to four DuckDB database
 </details>
 
 <details>
-<summary>🚨 outlier_rows — full row context for every outlier</summary>
-
-![Outlier Rows](assets/outlier_rows.png)
-
-</details>
-
-<details>
 <summary>🏆 top_n_by_group — top 3 salaries per tech stack</summary>
 
 ![Top N by Group](assets/top_n_by_group.png)
@@ -116,8 +111,8 @@ An MCP server that gives Claude direct, read-only access to four DuckDB database
 You:    "Which tech stacks in the SO Survey have the highest salary but lowest
          representation — hidden gems for job seekers?"
 
-Claude: [calls segment_analysis → so_survey · survey_results_public · tech_stack · salary_avg]
-        [calls column_distribution → so_survey · survey_results_public · tech_stack]
+Claude: [calls segment_analysis → so_survey · main.survey · tech_stack · salary_usd]
+        [calls column_distribution → so_survey · main.survey · tech_stack]
 
         → Scala: $187k median, only 2.1% of respondents
           Erlang: $168k, under 1%
@@ -127,20 +122,19 @@ Claude: [calls segment_analysis → so_survey · survey_results_public · tech_s
 ```
 You:    "Something feels off with the Olist revenue data — run a full check."
 
-Claude: [calls quality_report → olist · main_marts.mart_revenue]
-        [calls find_anomalies → olist · main_marts.mart_revenue · gross_revenue]
-        [calls null_pattern   → olist · main_marts.mart_revenue]
-        [calls outlier_rows   → olist · main_marts.mart_revenue · gross_revenue]
+Claude: [calls quality_report  → olist · main_marts.mart_revenue]
+        [calls find_anomalies  → olist · main_marts.mart_revenue · gross_revenue]
+        [calls null_pattern    → olist · main_marts.mart_revenue]
 
         → 97,276 rows. 0 nulls. 7,592 outliers (7.8%) — all in fixed_telephony category.
-          Top offender: $13,440 single order. Not a data error — category has high-ticket items.
+          Top offender: $13,440 single order. Not a data error — high-ticket items.
 ```
 
 ```
-You:    "Is the weather pipeline still fresh, and how does today compare to last week?"
+You:    "Is the weather pipeline still fresh, and how has temperature trended this month?"
 
-Claude: [calls freshness_check → weather · main.weather_history · recorded_at]
-        [calls trend_analysis  → weather · main.weather_history · recorded_at · temperature_c · day]
+Claude: [calls freshness_check → weather · main.weather_history · fetched_at]
+        [calls time_series     → weather · main.weather_history · fetched_at · temperature_c · day · trajectory]
 
         → FRESH — last record 4 hours ago.
           NYC: +3.2°C above 7-day average. Chicago trending cold (-2.1°C).
@@ -148,9 +142,10 @@ Claude: [calls freshness_check → weather · main.weather_history · recorded_a
 
 ---
 
-## 20 tools
+## 19 tools
 
 ### Discovery
+
 | Tool | What it does |
 |------|-------------|
 | `list_sources` | All connected sources with live status |
@@ -159,32 +154,35 @@ Claude: [calls freshness_check → weather · main.weather_history · recorded_a
 | `run_query(source, sql)` | Execute any `SELECT` / `WITH` — read-only enforced |
 
 ### Quality
+
 | Tool | What it does |
 |------|-------------|
 | `quality_report(source, table)` | Null counts · duplicate rate · numeric stats per column |
 | `null_pattern(source, table, min_nulls)` | Co-null patterns — which columns go null together |
 | `duplicate_check(source, table, key_cols)` | Exact duplicates on a specific key or composite key |
-| `find_anomalies(source, table, column)` | IQR outlier detection — count and % flagged |
-| `outlier_rows(source, table, column, limit)` | Full row context for every outlier — not just counts |
+| `find_anomalies(source, table, column, return_rows)` | IQR outlier detection — summary stats or full row context |
+| `smart_summary(source, table)` | One-call narrative: size · quality · numeric · categorical highlights |
 
 ### Exploration
+
 | Tool | What it does |
 |------|-------------|
 | `column_distribution(source, table, column, top_n)` | Categorical: top-N value counts · Numeric: 8-bucket histogram |
 | `profile_column(source, table, column)` | Full portrait — type · nulls · uniques · Q1/Q3/IQR · skew · top values |
-| `correlation(source, table, col1, col2)` | Pearson + Spearman (rank-based · no scipy required) |
-| `segment_analysis(source, table, group_col, value_col)` | `GROUP BY` + count / sum / mean / median / std per segment |
-| `top_n_by_group(source, table, group_col, value_col, n)` | Window-function top-N rows per group |
-| `smart_summary(source, table)` | One-call narrative: size · quality · numeric · categorical highlights |
+| `correlation(source, table, col1, col2)` | Pearson + Spearman (rank-based, no scipy required) |
+| `segment_analysis(source, table, group_col, value_col)` | `GROUP BY` — count / sum / mean / median / std per segment |
+| `top_n_by_group(source, table, group_col, value_col, n)` | Window-function top-N rows within each group |
 
-### Time series
+### Time Series & Statistics
+
 | Tool | What it does |
 |------|-------------|
 | `freshness_check(source, table, date_col)` | Latest entry · days since update · `FRESH` / `OK` / `STALE` label |
-| `trend_analysis(source, table, date_col, value_col, period)` | Metric over `day` / `week` / `month` |
-| `period_over_period(source, table, date_col, value_col, period)` | MoM / YoY with % change column |
+| `time_series(source, table, date_col, value_col, period, mode)` | Trend over `day/week/month` — raw trajectory or MoM % delta |
+| `significance_test(source, table, group_col, value_col)` | Welch's t-test + Mann-Whitney U + Cohen's d — requires exactly 2 groups |
 
 ### Output
+
 | Tool | What it does |
 |------|-------------|
 | `compare_tables(source1, table1, source2, table2)` | Row counts · shared columns · unique columns |
@@ -200,7 +198,7 @@ Claude: [calls freshness_check → weather · main.weather_history · recorded_a
 | `olist` | DuckDB | 97k | Brazilian e-commerce — orders · revenue · reviews (multi-schema dbt) |
 | `weather` | DuckDB | growing | Global Weather Pipeline — 20 cities · 6 continents · 2× daily |
 | `jobs` | DuckDB | 220 | Job Market Pulse — daily Adzuna API snapshots |
-| `uber` | Supabase PostgreSQL | — | Real Uber trip data — trips · payments · ratings |
+| `uber` | Supabase PostgreSQL | 3.7k | Real Uber trip data — trips · payments · ratings |
 
 ---
 
@@ -232,9 +230,25 @@ Claude never sees a connection string. The server is the only layer that touches
 | Constraint | How it's enforced |
 |-----------|-------------------|
 | Read-only DuckDB | `duckdb.connect(path, read_only=True)` |
-| Read-only PostgreSQL | Supabase connection with `SELECT`-only role |
+| Read-only PostgreSQL | `con.set_session(readonly=True, autocommit=True)` |
 | No DDL / DML via `run_query` | Statement rejected if it doesn't start with `SELECT` or `WITH` |
+| CTE-wrapped mutations blocked | Read-only session catches `WITH x AS (DELETE ...)` at the DB level |
 | No credentials in code | All paths and secrets in `.env` — never committed |
+
+---
+
+## Testing
+
+All 19 tools are validated against a 33-test checklist covering routing accuracy, confusion pairs, security, and edge cases.
+
+| Block | Coverage | Last run |
+|-------|----------|----------|
+| A — Routing (20 prompts) | Every tool triggered by natural language | 20/20 ✅ |
+| B — Confusion pairs (5 prompts) | Tools that previously mixed up | 5/5 ✅ |
+| C — Security / read-only (3 tests) | DELETE · CTE-DELETE · multi-statement | 3/3 ✅ |
+| D — Edge cases (5 tests) | BIGINT date trap · high cardinality · 3+ groups | 5/5 ✅ |
+
+See [`TESTING.md`](TESTING.md) for full prompts, expected routing, and two complete run logs.
 
 ---
 
@@ -279,13 +293,15 @@ claude mcp list
 
 ```
 mcp-data-quality-agent/
-├── server.py             # FastMCP server — all 20 tools
-├── requirements.txt      # mcp · duckdb · psycopg2-binary · pandas · python-dotenv
-├── .env.example          # template — copy to .env and fill in
+├── server.py                      # FastMCP server — 19 tools
+├── requirements.txt               # mcp · duckdb · psycopg2-binary · pandas · scipy · python-dotenv
+├── TESTING.md                     # 33-test checklist · 2 complete run logs
+├── .env.example                   # template — copy to .env and fill in
+├── assets/                        # screenshots for README
 ├── .github/
 │   └── workflows/
-│       └── health_check.yml   # import smoke test on every push
-└── .gitignore            # .env · __pycache__ · *.duckdb excluded
+│       └── quality_check.yml      # smoke-test: verifies all 19 tools on every push
+└── .gitignore                     # .env · __pycache__ · *.duckdb excluded
 ```
 
 ---
