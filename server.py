@@ -10,7 +10,7 @@ import pandas as pd
 from mcp.server.fastmcp import FastMCP
 from dotenv import load_dotenv
 
-load_dotenv()
+load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), '.env'))
 
 mcp = FastMCP("data-quality-agent")
 
@@ -40,6 +40,7 @@ def _duckdb_query(path: str, sql: str) -> pd.DataFrame:
 
 def _pg_query(sql: str) -> pd.DataFrame:
     con = psycopg2.connect(**PG_CONFIG)
+    con.set_session(readonly=True, autocommit=True)
     try:
         return pd.read_sql(sql, con)
     finally:
@@ -57,6 +58,25 @@ def _run(source: str, sql: str) -> pd.DataFrame:
     if not path:
         raise ValueError(f"Path for '{source}' not set in .env")
     return _duckdb_query(path, sql)
+
+
+def _validate_date_col(raw_val, col_name: str, source: str, table: str):
+    """Returns (parsed_ts, None) if valid date, or (None, error_str) if not date-like.
+
+    Catches the pd.to_datetime(int) trap: integers like 2018 are interpreted as
+    nanoseconds from epoch → 1970-01-01. The year < 1990 threshold is safe for
+    all current sources (olist 2016+, weather/jobs/uber recent). If historical
+    data is ever added, switch to dtype inspection instead of the year heuristic.
+    """
+    parsed = pd.to_datetime(raw_val, errors="coerce")
+    if pd.isna(parsed) or parsed.year < 1990:
+        return None, (
+            f"ERROR: column '{col_name}' in {source}.{table} is not date-like "
+            f"(raw value: {raw_val!r}). "
+            f"freshness_check and time_series need a DATE/TIMESTAMP column. "
+            f"Use describe_table to find available date columns."
+        )
+    return parsed, None
 
 
 # ── Tools ──────────────────────────────────────────────────────────────────────
@@ -102,7 +122,11 @@ def list_tables(source: str) -> str:
 
 @mcp.tool()
 def describe_table(source: str, table: str) -> str:
-    """Show schema, row count, and 3 sample rows.
+    """Structural overview of a table: column names/types, row count, and 3 sample rows.
+
+    Use when: user asks "what's in this table", "what columns does X have", or wants to understand table structure.
+    Do NOT use when: user wants a data health check, null rates, or distribution insights — use smart_summary instead
+    (smart_summary = data-quality narrative; describe_table = structural overview only).
 
     Args:
         source: one of 'so_survey', 'olist', 'weather', 'jobs', 'uber'
@@ -124,13 +148,19 @@ def describe_table(source: str, table: str) -> str:
     return (
         f"=== Schema ===\n{schema.to_string(index=False)}\n\n"
         f"=== Row Count ===\n{count.to_string(index=False)}\n\n"
-        f"=== Sample (3 rows) ===\n{sample.to_string(index=False)}"
+        f"=== Sample (3 rows) ===\n{sample.to_string(index=False)}\n\n"
+        f"(Note: schema only — this tool does NOT return column descriptions. "
+        f"Do not invent or present descriptions as tool output.)"
     )
 
 
 @mcp.tool()
 def run_query(source: str, sql: str) -> str:
-    """Run a SELECT query on a data source.
+    """Escape hatch — run any custom SELECT query when no specialized tool fits.
+
+    Use when: the question requires custom SQL that specialized tools cannot express.
+    Do NOT use when: a specialized tool exists — prefer correlation, segment_analysis,
+    time_series, top_n_by_group, etc. over writing SQL manually.
 
     Args:
         source: one of 'so_survey', 'olist', 'weather', 'jobs', 'uber'
@@ -147,7 +177,11 @@ def run_query(source: str, sql: str) -> str:
 
 @mcp.tool()
 def quality_report(source: str, table: str) -> str:
-    """Data quality report: null counts, duplicates, numeric stats.
+    """Structured QA metrics: per-column null counts, duplicate rows, numeric stats.
+
+    Use when: running a data-quality gate, pipeline validation, or need exact null/dup counts per column.
+    Do NOT use when: user wants a quick overview — use smart_summary instead (it includes a narrative).
+    For co-occurring nulls across columns use null_pattern.
 
     Args:
         source: one of 'so_survey', 'olist', 'weather', 'jobs', 'uber'
@@ -182,36 +216,68 @@ def quality_report(source: str, table: str) -> str:
 
 
 @mcp.tool()
-def find_anomalies(source: str, table: str, column: str) -> str:
+def find_anomalies(
+    source: str, table: str, column: str, return_rows: bool = False, limit: int = 20
+) -> str:
     """Find outliers in a numeric column using IQR method.
+
+    Use when: user asks about outliers, anomalies, or extreme values in a numeric column.
+    Set return_rows=True to see the actual offending rows with full context.
+    NOT for: categorical columns, full-table quality checks (use quality_report),
+    or exact-match duplicate rows (use duplicate_check).
 
     Args:
         source: one of 'so_survey', 'olist', 'weather', 'jobs', 'uber'
         table: table name
         column: numeric column to analyze
+        return_rows: False (default) = summary stats; True = actual outlier rows
+        limit: max rows to return when return_rows=True (default 20)
     """
-    df = _run(source, f"SELECT {column} FROM {table} WHERE {column} IS NOT NULL")
-    series = pd.to_numeric(df[column], errors="coerce").dropna()
+    if return_rows:
+        df = _run(source, f"SELECT * FROM {table} WHERE {column} IS NOT NULL")
+        series = pd.to_numeric(df[column], errors="coerce")
+        q1, q3 = series.quantile(0.25), series.quantile(0.75)
+        iqr = q3 - q1
+        lower, upper = q1 - 1.5 * iqr, q3 + 1.5 * iqr
+        mask = (series < lower) | (series > upper)
+        outlier_df = df[mask].sort_values(column, ascending=False).head(limit)
 
-    q1, q3 = series.quantile(0.25), series.quantile(0.75)
-    iqr = q3 - q1
-    lower, upper = q1 - 1.5 * iqr, q3 + 1.5 * iqr
-    outliers = series[(series < lower) | (series > upper)]
+        if outlier_df.empty:
+            return f"No outliers detected in {source}.{table}.{column}"
 
-    if outliers.empty:
-        return f"No outliers detected in {source}.{table}.{column}"
+        return (
+            f"Outlier rows: {source}.{table}.{column}\n"
+            f"IQR bounds: [{lower:.2f}, {upper:.2f}]  |  "
+            f"Total outliers: {mask.sum():,}  |  Showing top {len(outlier_df)}\n\n"
+            f"{outlier_df.to_string(index=False)}"
+        )
+    else:
+        df = _run(source, f"SELECT {column} FROM {table} WHERE {column} IS NOT NULL")
+        series = pd.to_numeric(df[column], errors="coerce").dropna()
+        q1, q3 = series.quantile(0.25), series.quantile(0.75)
+        iqr = q3 - q1
+        lower, upper = q1 - 1.5 * iqr, q3 + 1.5 * iqr
+        outliers = series[(series < lower) | (series > upper)]
 
-    return (
-        f"Column: {source}.{table}.{column}  |  Rows analyzed: {len(series):,}\n"
-        f"IQR bounds: [{lower:.2f}, {upper:.2f}]\n"
-        f"Outliers: {len(outliers):,} ({len(outliers)/len(series)*100:.1f}%)\n"
-        f"Outlier range: [{outliers.min():.2f}, {outliers.max():.2f}]"
-    )
+        if outliers.empty:
+            return f"No outliers detected in {source}.{table}.{column}"
+
+        return (
+            f"Column: {source}.{table}.{column}  |  Rows analyzed: {len(series):,}\n"
+            f"IQR bounds: [{lower:.2f}, {upper:.2f}]\n"
+            f"Outliers: {len(outliers):,} ({len(outliers)/len(series)*100:.1f}%)\n"
+            f"Outlier range: [{outliers.min():.2f}, {outliers.max():.2f}]\n\n"
+            f"Tip: call with return_rows=True to see the actual rows"
+        )
 
 
 @mcp.tool()
 def column_distribution(source: str, table: str, column: str, top_n: int = 10) -> str:
-    """Top-N value counts for categorical columns; bucketed distribution for numeric.
+    """Lightweight distribution for one column: top-N counts (categorical) or bucketed histogram (numeric).
+
+    Use when: user wants a quick look at value spread for a single column.
+    Do NOT use when: user wants nulls, uniques, outliers, or skew too — use profile_column instead
+    (it includes distribution plus full stats in one shot).
 
     Args:
         source: one of 'so_survey', 'olist', 'weather', 'jobs', 'uber'
@@ -264,8 +330,12 @@ def freshness_check(source: str, table: str, date_col: str) -> str:
         f"SELECT MIN({date_col}) as oldest, MAX({date_col}) as latest, COUNT(*) as total_rows FROM {table}",
     )
     row = df.iloc[0]
-    latest = pd.to_datetime(row["latest"])
-    oldest = pd.to_datetime(row["oldest"])
+    latest, err = _validate_date_col(row["latest"], date_col, source, table)
+    if err:
+        return err
+    oldest, _ = _validate_date_col(row["oldest"], date_col, source, table)
+    if oldest is None:
+        oldest = latest
     # normalize to naive for diff
     latest_naive = latest.replace(tzinfo=None) if latest.tzinfo else latest
     oldest_naive = oldest.replace(tzinfo=None) if oldest.tzinfo else oldest
@@ -286,11 +356,15 @@ def freshness_check(source: str, table: str, date_col: str) -> str:
 def correlation(source: str, table: str, col1: str, col2: str) -> str:
     """Pearson + Spearman correlation between two numeric columns.
 
+    Use when: user asks whether two numeric values move together (e.g. price vs distance).
+    BOTH columns must be numeric — for a numeric vs categorical relationship use segment_analysis.
+    Do NOT use when: comparing two TABLES — use compare_tables instead.
+
     Args:
         source: one of 'so_survey', 'olist', 'weather', 'jobs', 'uber'
         table: table name
-        col1: first numeric column
-        col2: second numeric column
+        col1: first numeric column (e.g. 'fare_amount')
+        col2: second numeric column (e.g. 'trip_distance')
     """
     df = _run(
         source,
@@ -318,13 +392,17 @@ def correlation(source: str, table: str, col1: str, col2: str) -> str:
 
 @mcp.tool()
 def compare_tables(source1: str, table1: str, source2: str, table2: str) -> str:
-    """Compare two tables: row counts, column counts, shared vs unique columns.
+    """Compare two TABLES: row counts, column counts, shared vs unique columns.
+
+    Use when: user wants to compare the structure or size of two different tables.
+    Do NOT use when: comparing two numeric columns within one table — use correlation instead.
+    Do NOT use when: comparing metric values across groups — use segment_analysis instead.
 
     Args:
-        source1: first source name
-        table1: first table name
-        source2: second source name
-        table2: second table name
+        source1: first source name (e.g. 'olist')
+        table1: first table name (e.g. 'orders')
+        source2: second source name (e.g. 'uber')
+        table2: second table name (e.g. 'trips')
     """
     count1 = _run(source1, f"SELECT COUNT(*) as n FROM {table1}").iloc[0]["n"]
     count2 = _run(source2, f"SELECT COUNT(*) as n FROM {table2}").iloc[0]["n"]
@@ -348,58 +426,22 @@ def compare_tables(source1: str, table1: str, source2: str, table2: str) -> str:
     ])
 
 
-@mcp.tool()
-def trend_analysis(source: str, table: str, date_col: str, value_col: str, period: str = "month") -> str:
-    """Aggregate a metric over time — shows how a value changes by day/week/month.
-
-    Args:
-        source: one of 'so_survey', 'olist', 'weather', 'jobs', 'uber'
-        table: table name
-        date_col: date or timestamp column to group by
-        value_col: numeric column to aggregate (count, sum, avg shown)
-        period: 'day', 'week', or 'month' (default: 'month')
-    """
-    if period not in {"day", "week", "month"}:
-        return "ERROR: period must be 'day', 'week', or 'month'"
-
-    df = _run(
-        source,
-        f"SELECT {date_col}, {value_col} FROM {table} "
-        f"WHERE {date_col} IS NOT NULL AND {value_col} IS NOT NULL",
-    )
-    df[date_col] = pd.to_datetime(df[date_col], errors="coerce", utc=True)
-    df[value_col] = pd.to_numeric(df[value_col], errors="coerce")
-    df = df.dropna()
-
-    freq_map = {"day": "D", "week": "W", "month": "M"}
-    df["period"] = df[date_col].dt.to_period(freq_map[period])
-
-    grouped = (
-        df.groupby("period")[value_col]
-        .agg(count="count", total="sum", avg="mean")
-        .reset_index()
-    )
-    grouped["total"] = grouped["total"].round(2)
-    grouped["avg"] = grouped["avg"].round(2)
-
-    return (
-        f"Trend: {source}.{table} | {value_col} by {period}\n"
-        f"Periods: {len(grouped)}  |  Range: {grouped['period'].iloc[0]} → {grouped['period'].iloc[-1]}\n\n"
-        f"{grouped.to_string(index=False)}"
-    )
-
-
 # ── Tier 1: Core DA work ───────────────────────────────────────────────────────
 
 @mcp.tool()
 def segment_analysis(source: str, table: str, group_col: str, value_col: str) -> str:
-    """GROUP BY a column and show count/sum/mean/median/std per segment.
+    """Aggregate a numeric metric ACROSS groups — one summary row per group (count/sum/mean/median/std).
+
+    Use when: user asks for average/total per category, ranking of groups, or numeric-by-category relationship.
+    Do NOT use when: user wants top-N individual rows within each group — use top_n_by_group instead.
+    Do NOT use when: both columns are numeric — use correlation instead.
+    Prefer this over run_query for GROUP BY aggregations.
 
     Args:
         source: one of 'so_survey', 'olist', 'weather', 'jobs', 'uber'
         table: table name
-        group_col: categorical column to group by
-        value_col: numeric column to aggregate
+        group_col: categorical column to group by (e.g. 'payment_type')
+        value_col: numeric column to aggregate (e.g. 'payment_value')
     """
     df = _run(
         source,
@@ -418,34 +460,55 @@ def segment_analysis(source: str, table: str, group_col: str, value_col: str) ->
     for col in ["total", "mean", "median", "std"]:
         grouped[col] = grouped[col].round(2)
 
+    GROUP_CAP = 100
+    total_groups = len(grouped)
+    cap_note = f"  (showing top {GROUP_CAP} of {total_groups})" if total_groups > GROUP_CAP else ""
+    grouped = grouped.head(GROUP_CAP)
+
     return (
         f"Segment analysis: {source}.{table} | {group_col} → {value_col}\n"
-        f"Segments: {len(grouped):,}  |  Total rows: {len(df):,}\n\n"
+        f"Segments: {total_groups:,}{cap_note}  |  Total rows: {len(df):,}\n\n"
         f"{grouped.to_string(index=False)}"
     )
 
 
 @mcp.tool()
-def period_over_period(
-    source: str, table: str, date_col: str, value_col: str, period: str = "month"
+def time_series(
+    source: str, table: str, date_col: str, value_col: str,
+    period: str = "month", mode: str = "trajectory"
 ) -> str:
-    """Show metric totals per period + % change vs previous period (MoM, WoW, YoY).
+    """Aggregate a metric over time periods — raw trajectory or period-over-period % change.
+
+    Use when: user asks how a value changes over time, time trends, or MoM/WoW/YoY growth.
+    mode='trajectory' — raw values per period (totals/avg/count). Use for "how did X evolve over time".
+    mode='delta'      — % change vs previous period (MoM, WoW, YoY). Use for "how much did X grow/drop".
+    Do NOT use when: comparing groups (use segment_analysis) or two numeric columns (use correlation).
+    Prefer this over run_query for any time-based aggregation.
 
     Args:
         source: one of 'so_survey', 'olist', 'weather', 'jobs', 'uber'
         table: table name
-        date_col: date or timestamp column
-        value_col: numeric column to aggregate
+        date_col: date or timestamp column to group by (e.g. 'order_purchase_timestamp')
+        value_col: numeric column to aggregate (e.g. 'payment_value')
         period: 'day', 'week', 'month', or 'year' (default: 'month')
+        mode: 'trajectory' (raw values, default) or 'delta' (% change vs prior period)
     """
     if period not in {"day", "week", "month", "year"}:
         return "ERROR: period must be 'day', 'week', 'month', or 'year'"
+    if mode not in {"trajectory", "delta"}:
+        return "ERROR: mode must be 'trajectory' or 'delta'"
 
     df = _run(
         source,
         f"SELECT {date_col}, {value_col} FROM {table} "
         f"WHERE {date_col} IS NOT NULL AND {value_col} IS NOT NULL",
     )
+    # Guard: detect int-as-nanoseconds trap before converting full series
+    sample_raw = df[date_col].dropna().iloc[0] if not df[date_col].dropna().empty else None
+    if sample_raw is not None:
+        _, err = _validate_date_col(sample_raw, date_col, source, table)
+        if err:
+            return err
     df[date_col] = pd.to_datetime(df[date_col], errors="coerce", utc=True)
     df[value_col] = pd.to_numeric(df[value_col], errors="coerce")
     df = df.dropna()
@@ -460,12 +523,17 @@ def period_over_period(
     )
     grouped["total"] = grouped["total"].round(2)
     grouped["avg"] = grouped["avg"].round(2)
-    grouped["change_pct"] = (
-        (grouped["total"] - grouped["total"].shift(1)) / grouped["total"].shift(1) * 100
-    ).round(1)
+
+    if mode == "delta":
+        grouped["change_pct"] = (
+            (grouped["total"] - grouped["total"].shift(1)) / grouped["total"].shift(1) * 100
+        ).round(1)
+        label = "Period-over-period"
+    else:
+        label = "Trend"
 
     return (
-        f"Period-over-period: {source}.{table} | {value_col} by {period}\n"
+        f"{label}: {source}.{table} | {value_col} by {period}  [mode={mode}]\n"
         f"Periods: {len(grouped)}  |  Range: {grouped['period'].iloc[0]} → {grouped['period'].iloc[-1]}\n\n"
         f"{grouped.to_string(index=False)}"
     )
@@ -475,13 +543,18 @@ def period_over_period(
 def top_n_by_group(
     source: str, table: str, group_col: str, value_col: str, n: int = 3
 ) -> str:
-    """Show top-N rows by value within each group (window-function style).
+    """Top-N individual rows WITHIN each group by a numeric value (window-function style).
+
+    Use when: user wants the top performers inside each category (e.g. top 3 products per seller).
+    Do NOT use when: user wants to rank or compare the GROUPS themselves — use segment_analysis instead
+    (it gives one row per group with aggregates, not individual rows).
+    Prefer this over run_query for RANK() / PARTITION BY patterns.
 
     Args:
         source: one of 'so_survey', 'olist', 'weather', 'jobs', 'uber'
         table: table name
-        group_col: column to group by
-        value_col: numeric column to rank by (descending)
+        group_col: column to group by (e.g. 'seller_id')
+        value_col: numeric column to rank by descending (e.g. 'revenue')
         n: how many top rows per group (default 3)
     """
     df = _run(
@@ -499,9 +572,14 @@ def top_n_by_group(
     )
     top = df[df["rank"] <= n].sort_values([group_col, "rank"])
 
+    ROW_CAP = 300
+    total_rows = len(top)
+    cap_note = f"  (capped at {ROW_CAP} rows — use a more specific group_col)" if total_rows > ROW_CAP else ""
+    top = top.head(ROW_CAP)
+
     return (
         f"Top {n} by group: {source}.{table} | {group_col} → {value_col}\n"
-        f"Groups: {df[group_col].nunique():,}  |  Rows shown: {len(top):,}\n\n"
+        f"Groups: {df[group_col].nunique():,}  |  Rows shown: {len(top):,}{cap_note}\n\n"
         f"{top.to_string(index=False)}"
     )
 
@@ -510,12 +588,16 @@ def top_n_by_group(
 
 @mcp.tool()
 def null_pattern(source: str, table: str, min_nulls: int = 2) -> str:
-    """Find rows where multiple columns are NULL simultaneously — reveals structural gaps.
+    """Find which columns go NULL TOGETHER (co-occurrence) — reveals structural data gaps.
+
+    Use when: user asks which fields are missing together, or suspects optional record types
+    that leave multiple columns blank simultaneously.
+    Do NOT use when: user wants per-column null counts — use quality_report instead.
 
     Args:
         source: one of 'so_survey', 'olist', 'weather', 'jobs', 'uber'
         table: table name
-        min_nulls: minimum number of simultaneous nulls per row (default 2)
+        min_nulls: minimum simultaneous nulls per row to count (default 2)
     """
     df = _run(source, f"SELECT * FROM {table}")
     total = len(df)
@@ -559,12 +641,15 @@ def null_pattern(source: str, table: str, min_nulls: int = 2) -> str:
 
 @mcp.tool()
 def duplicate_check(source: str, table: str, key_cols: str) -> str:
-    """Check for duplicates on specific key columns (not full row).
+    """Check for exact-match duplicate values on specific key columns.
+
+    Use when: user asks if a key column (like order_id) is truly unique, or suspecting duplicate records.
+    Do NOT use when: looking for numeric outliers or anomalies — use find_anomalies instead.
 
     Args:
         source: one of 'so_survey', 'olist', 'weather', 'jobs', 'uber'
         table: table name
-        key_cols: comma-separated columns to check, e.g. 'order_id' or 'order_id,product_id'
+        key_cols: comma-separated columns to check (e.g. 'order_id' or 'order_id,product_id')
     """
     cols = [c.strip() for c in key_cols.split(",")]
     col_list = ", ".join(cols)
@@ -590,37 +675,6 @@ def duplicate_check(source: str, table: str, key_cols: str) -> str:
         f"Duplicate check: {source}.{table} | key=[{key_cols}]\n"
         f"Total rows: {total:,}  |  Duplicate keys: {dup_keys:,}  |  Extra rows: {extra_rows:,}\n\n"
         f"Top duplicates:\n{dups.to_string(index=False)}"
-    )
-
-
-@mcp.tool()
-def outlier_rows(source: str, table: str, column: str, limit: int = 20) -> str:
-    """Return the actual rows containing outliers (IQR method) — full context for investigation.
-
-    Args:
-        source: one of 'so_survey', 'olist', 'weather', 'jobs', 'uber'
-        table: table name
-        column: numeric column to detect outliers on
-        limit: max rows to return (default 20)
-    """
-    df = _run(source, f"SELECT * FROM {table} WHERE {column} IS NOT NULL")
-    series = pd.to_numeric(df[column], errors="coerce")
-
-    q1, q3 = series.quantile(0.25), series.quantile(0.75)
-    iqr = q3 - q1
-    lower, upper = q1 - 1.5 * iqr, q3 + 1.5 * iqr
-
-    mask = (series < lower) | (series > upper)
-    outlier_df = df[mask].sort_values(column, ascending=False).head(limit)
-
-    if outlier_df.empty:
-        return f"No outliers detected in {source}.{table}.{column}"
-
-    return (
-        f"Outlier rows: {source}.{table}.{column}\n"
-        f"IQR bounds: [{lower:.2f}, {upper:.2f}]  |  "
-        f"Total outliers: {mask.sum():,}  |  Showing top {len(outlier_df)}\n\n"
-        f"{outlier_df.to_string(index=False)}"
     )
 
 
@@ -662,7 +716,13 @@ def export_csv(source: str, sql: str, filename: str) -> str:
 
 @mcp.tool()
 def smart_summary(source: str, table: str) -> str:
-    """Auto-generate a narrative summary: size, quality issues, numeric highlights, top categories.
+    """Data-quality health check with narrative — null rates, outlier flags, and distribution highlights.
+
+    Use when: user asks for a health check, data quality summary, or wants to understand what's WRONG or notable
+    in the data (nulls, duplicates, outliers, skew). Think: "is this data clean/reliable?"
+    Do NOT use when: user wants column names and types — use describe_table instead (structural overview).
+    Do NOT use when: user needs structured QA metrics (null counts by column, exact dup count)
+    — use quality_report instead. smart_summary is for humans; quality_report is for pipelines.
 
     Args:
         source: one of 'so_survey', 'olist', 'weather', 'jobs', 'uber'
@@ -735,12 +795,16 @@ def smart_summary(source: str, table: str) -> str:
 
 @mcp.tool()
 def profile_column(source: str, table: str, column: str) -> str:
-    """Full statistical profile of a single column — type, nulls, uniques, distribution, outliers in one shot.
+    """Full statistical profile of one column: nulls, uniques, distribution, outliers, and skew in one shot.
+
+    Use when: user asks to "tell me about column X" or needs a complete picture of one column.
+    Do NOT use when: user only needs value distribution — use column_distribution (faster, lighter).
+    Prefer this over column_distribution when investigating data quality issues in a column.
 
     Args:
         source: one of 'so_survey', 'olist', 'weather', 'jobs', 'uber'
         table: table name
-        column: column to profile
+        column: column to profile (e.g. 'payment_value')
     """
     df = _run(source, f"SELECT {column} FROM {table}")
     total = len(df)
@@ -806,6 +870,78 @@ def profile_column(source: str, table: str, column: str) -> str:
             lines.append(f"  {str(val)[:28]:28}  {cnt:>8,}  {pct:5.1f}%  {bar}")
 
     return "\n".join(lines)
+
+
+@mcp.tool()
+def significance_test(source: str, table: str, group_col: str, value_col: str) -> str:
+    """Test whether two groups differ statistically — Welch's t-test + Mann-Whitney + Cohen's d.
+
+    Use when: user asks if a difference is significant, A/B test analysis, comparing
+    a metric between two segments (e.g. paid vs free, male vs female, city A vs city B).
+    Requires exactly 2 groups — filter the table first if there are more.
+    NOT for: more than 2 groups (use segment_analysis), categorical outcome variables.
+
+    Args:
+        source: one of 'so_survey', 'olist', 'weather', 'jobs', 'uber'
+        table: table name
+        group_col: categorical column with exactly 2 distinct values
+        value_col: numeric column to compare between the two groups
+    """
+    from scipy import stats
+
+    df = _run(
+        source,
+        f"SELECT {group_col}, {value_col} FROM {table} "
+        f"WHERE {group_col} IS NOT NULL AND {value_col} IS NOT NULL",
+    )
+    df[value_col] = pd.to_numeric(df[value_col], errors="coerce")
+    df = df.dropna()
+
+    groups = df[group_col].unique()
+    if len(groups) != 2:
+        available = list(groups[:10])
+        return (
+            f"ERROR: significance_test requires exactly 2 groups. "
+            f"Found {len(groups)} in '{group_col}': {available}. "
+            f"Filter the table first with run_query, or use segment_analysis for multiple groups."
+        )
+
+    g1 = df[df[group_col] == groups[0]][value_col]
+    g2 = df[df[group_col] == groups[1]][value_col]
+
+    t_stat, p_ttest = stats.ttest_ind(g1, g2, equal_var=False)  # Welch's
+    u_stat, p_mw = stats.mannwhitneyu(g1, g2, alternative="two-sided")
+
+    n1, n2 = len(g1), len(g2)
+    pooled_std = (((n1 - 1) * g1.std() ** 2 + (n2 - 1) * g2.std() ** 2) / (n1 + n2 - 2)) ** 0.5
+    cohens_d = (g1.mean() - g2.mean()) / pooled_std if pooled_std > 0 else 0
+    effect = "large" if abs(cohens_d) >= 0.8 else ("medium" if abs(cohens_d) >= 0.5 else "small")
+
+    both_sig = p_ttest < 0.05 and p_mw < 0.05
+    neither_sig = p_ttest >= 0.05 and p_mw >= 0.05
+    if both_sig:
+        interpretation = "Both tests agree: the difference is statistically significant."
+    elif neither_sig:
+        interpretation = "No statistically significant difference detected at α=0.05."
+    else:
+        interpretation = "Tests disagree — check for outliers or heavily non-normal distribution."
+
+    rel_diff = abs((g1.mean() - g2.mean()) / g2.mean() * 100) if g2.mean() != 0 else float("nan")
+
+    return (
+        f"Significance test: {source}.{table} | {group_col} → {value_col}\n\n"
+        f"Group A '{groups[0]}':  n={len(g1):,}  mean={g1.mean():.2f}  "
+        f"std={g1.std():.2f}  median={g1.median():.2f}\n"
+        f"Group B '{groups[1]}':  n={len(g2):,}  mean={g2.mean():.2f}  "
+        f"std={g2.std():.2f}  median={g2.median():.2f}\n\n"
+        f"Welch's t-test:  t={t_stat:+.3f}   p={p_ttest:.4f}  "
+        f"{'✓ SIGNIFICANT' if p_ttest < 0.05 else '✗ not significant'}\n"
+        f"Mann-Whitney U:  U={u_stat:.0f}   p={p_mw:.4f}  "
+        f"{'✓ SIGNIFICANT' if p_mw < 0.05 else '✗ not significant'}\n\n"
+        f"Effect size (Cohen's d): {cohens_d:+.3f}  ({effect})\n"
+        f"Mean difference: {g1.mean() - g2.mean():+.2f}  ({rel_diff:.1f}% relative)\n\n"
+        f"Interpretation: {interpretation}"
+    )
 
 
 if __name__ == "__main__":
